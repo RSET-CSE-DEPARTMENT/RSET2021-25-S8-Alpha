@@ -1,4 +1,3 @@
-# filepath: /C:/Users/97155/Desktop/final year project/UI/backend/server.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import google.generativeai as genai
@@ -58,7 +57,7 @@ def generate_caption():
 
         logger.info(f"Received prompt request: {prompt[:30]}...")
         
-        prompt += " It should be for an Instagram photo. Add relevant emojis if needed. Return a single creative caption of less than 15 words. append 3 to 4 relevant and popular instagram hashtags at the end of the caption."
+        prompt += " It should be for an Instagram photo. Add relevant emojis if needed. Return a single creative caption of less than 15 words."
 
         # Load Gemini model
         model = genai.GenerativeModel("gemini-1.5-pro")
@@ -84,6 +83,101 @@ def generate_caption():
     
 from PIL import Image
 import io
+import torch
+from transformers import (
+    AutoProcessor, AutoModelForCausalLM, 
+    LxmertTokenizer, LxmertModel
+)
+
+git_model_name = "path-to-finetuned-microsoft-git-base-model" 
+git_processor = AutoProcessor.from_pretrained(git_model_name)
+git_model = AutoModelForCausalLM.from_pretrained(git_model_name)
+
+lxmert_model_name = "path-to-lxmert4hashtag"  
+lxmert_tokenizer = LxmertTokenizer.from_pretrained(lxmert_model_name)
+lxmert_model = LxmertModel.from_pretrained(lxmert_model_name)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+git_model.to(device)
+lxmert_model.to(device)
+git_model.eval()
+lxmert_model.eval()
+
+def generate_caption_with_git(image_pil):
+    try:
+        # Process image for GIT model
+        inputs = git_processor(images=image_pil, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            # Generate caption
+            generated_ids = git_model.generate(
+                pixel_values=inputs.pixel_values,
+                max_length=50,
+                num_beams=4,
+                do_sample=False,
+                early_stopping=True
+            )
+            
+        # Decode the generated caption
+        initial_caption = git_processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+        
+        return initial_caption.strip()
+        
+    except Exception as e:
+        logger.error(f"Error in GIT caption generation: {str(e)}")
+        raise
+
+def generate_hashtags_with_lxmert(image_pil, caption):
+        
+    try:
+        # Preprocess image for LXMERT
+        from torchvision import transforms
+        
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        image_tensor = transform(image_pil).unsqueeze(0).to(device)
+        
+        inputs = lxmert_tokenizer(caption, return_tensors="pt", truncation=True, max_length=512).to(device)
+        
+        with torch.no_grad():
+            outputs = lxmert_model(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                visual_feats=image_tensor,
+                visual_pos=None
+            )
+            
+            # Decode the refined output
+            predicted_tokens = torch.argmax(outputs.prediction_logits, dim=-1)
+            caption_with_hashtags = lxmert_tokenizer.decode(predicted_tokens[0], skip_special_tokens=True)
+            
+        return caption_with_hashtags
+        
+    except Exception as e:
+        logger.error(f"Error in LXMERT caption refinement: {str(e)}")
+        raise
+
+def generate_caption_and_hashtag(image_pil):
+    
+    try:
+        logger.info("Stage 1: Generating caption with GIT model")
+        initial_caption = generate_caption_with_git(image_pil)
+        logger.info(f"Initial caption: {initial_caption}")
+        
+        logger.info("Stage 2: generating hashtags with LXMERT")
+        final_caption_with_hashtags = generate_hashtags_with_lxmert(
+            image_pil, initial_caption
+        )
+        
+        return final_caption_with_hashtags
+        
+    except Exception as e:
+        logger.error(f"Error in two-stage caption generation: {str(e)}")
+        raise
 
 @app.route('/generate-caption-from-image', methods=['POST'])
 def generate_caption_from_image():
@@ -105,52 +199,23 @@ def generate_caption_from_image():
         # Convert bytes to PIL Image
         image_pil = Image.open(io.BytesIO(image_bytes))
         
-        # Prompt message
-        prompt = "Generate a single short creative Instagram caption with less than 20 words, relevant emojis, and no other description. Append 3 to 4 relevant and popular hashtags at the end of the caption."
+        # Generate caption using two-stage approach
+        final_caption_with_hashtags = generate_caption_and_hashtag(image_pil)
         
-        # Generate caption using Gemini Vision model
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content([prompt, image_pil])
-
-        if response and hasattr(response, 'candidates') and response.candidates:
-            caption = response.candidates[0].content.parts[0].text
-
-            model = genai.GenerativeModel("gemini-1.5-pro")
-
-            prompt = "Choose the best category for the given caption. The categories are: social_media, fashion_beauty, travel_adventure, nature_outdoors, food_culinary, pets_animals, motivation_inspiration, career_jobs, technology_engineering, entertainment_media, gaming, health_wellness, business_entrepreneurship, education_learning, sustainability_environment, arts_culture, legal, politics_government, real_estate, events_networking, nonprofit_philanthropy, diversity_inclusion. Return a single category."            
-            response = model.generate_content([prompt, caption])
-            print("Categories response:", response)
-            category = response.candidates[0].content.parts[0].text.strip()
-
-            categories_data = load_json_file("C:\\Users\\Ann\\Documents\\project\\UI\\backend\\hashtag-categories.json")
-
-            if category in categories_data:
-                hashtags = categories_data[category]
-                count = 0
-                for tag in hashtags:
-                    caption += " #" + tag[0]
-                    count += 1
-                    if count == 5:
-                        break
-            else:
-                print(f"Category '{category}' not found in categories data")
-
-            logger.info(f"Generated caption: {caption}")
-            return jsonify({'caption': caption})
-        else:
-            logger.error("Content blocked or no response generated")
-            return jsonify({'error': 'Content blocked or no response generated'}), 400
+        logger.info(f"Generated final caption: {final_caption_with_hashtags}")
+        return jsonify({'caption': final_caption_with_hashtags})
 
     except Exception as e:
         logger.exception("Error in generate_caption_from_image endpoint")
         return jsonify({'error': f'Server error: {str(e)}'}), 500
+
 
 def validate_instagram_username(username: str):
     client = ApifyClient(APIFY_TOKEN)
     run_input = { "usernames": [username] }
 
     try:
-        run = client.actor("dSCLg0C3YEZ83HzYX").call(run_input=run_input)
+        run = client.actor("YOUR-PARTICULAR-ACTOR-ID").call(run_input=run_input)
         for item in client.dataset(run["defaultDatasetId"]).iterate_items():
             error = item.get("error")
             is_private = item.get("private")
@@ -180,7 +245,7 @@ def get_average_likes_and_comments(username: str):
     }
 
     try:
-        run = client.actor("nH2AHrwxeTRJoN5hX").call(run_input=run_input)
+        run = client.actor("YOUR-PARTICULAR-ACTOR-ID").call(run_input=run_input)
         likes = []
         comments = []
 
